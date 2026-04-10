@@ -1,4 +1,16 @@
-import { defineBundledChannelEntry } from "openclaw/plugin-sdk/channel-entry-contract";
+import {
+  defineBundledChannelEntry,
+  loadBundledEntryExportSync,
+} from "openclaw/plugin-sdk/channel-entry-contract";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-entry-contract";
+
+function registerTelegramPluginHttpRoutes(api: OpenClawPluginApi): void {
+  const register = loadBundledEntryExportSync<(api: OpenClawPluginApi) => void>(import.meta.url, {
+    specifier: "./runtime-api.js",
+    exportName: "registerTelegramPluginHttpRoutes",
+  });
+  register(api);
+}
 
 export default defineBundledChannelEntry({
   id: "telegram",
@@ -17,4 +29,5 @@ export default defineBundledChannelEntry({
     specifier: "./runtime-api.js",
     exportName: "setTelegramRuntime",
   },
+  registerFull: registerTelegramPluginHttpRoutes,
 });
