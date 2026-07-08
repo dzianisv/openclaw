@@ -807,13 +807,37 @@ export function createBrowserTool(opts?: {
             onTabActivity: touchTrackedTab,
           });
         case "screenshot": {
-          const targetId = readStringParam(params, "targetId");
+          const screenshotUrl = readStringParam(params, "targetUrl") ?? readStringParam(params, "url");
+          let targetId = readStringParam(params, "targetId");
           const fullPage = Boolean(params.fullPage);
           const ref = readStringParam(params, "ref");
           const element = readStringParam(params, "element");
           const labels = typeof params.labels === "boolean" ? params.labels : undefined;
           const type = params.type === "jpeg" ? "jpeg" : "png";
           const effectiveTimeoutMs = requestedTimeoutMs ?? DEFAULT_BROWSER_SCREENSHOT_TIMEOUT_MS;
+          if (screenshotUrl) {
+            // The tool schema is flat across actions, so a url on a screenshot
+            // call used to be silently ignored and the active (possibly stale,
+            // possibly private) tab was captured instead of the requested
+            // page. Navigate first — the same path as the navigate action —
+            // then capture the navigated tab.
+            if (proxyRequest) {
+              const navigated = (await proxyRequest({
+                method: "POST",
+                path: "/navigate",
+                profile,
+                body: { url: screenshotUrl, targetId },
+              })) as Record<string, unknown>;
+              targetId = readStringValue(navigated.targetId) ?? targetId;
+            } else {
+              const navigated = await browserToolDeps.browserNavigate(baseUrl, {
+                url: screenshotUrl,
+                targetId,
+                profile,
+              });
+              targetId = readStringValue(navigated.targetId) ?? targetId;
+            }
+          }
           const result = proxyRequest
             ? ((await proxyRequest({
                 method: "POST",
