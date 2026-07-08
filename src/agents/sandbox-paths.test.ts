@@ -37,6 +37,8 @@ async function withManagedMediaRoot<T>(run: (ctx: { stateDir: string }) => Promi
     return await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, async () => {
       await fs.mkdir(path.join(stateDir, "media", "outbound"), { recursive: true });
       await fs.mkdir(path.join(stateDir, "media", "tool-image-generation"), { recursive: true });
+      await fs.mkdir(path.join(stateDir, "media", "browser"), { recursive: true });
+      await fs.mkdir(path.join(stateDir, "media", "file-transfer"), { recursive: true });
       return await run({ stateDir });
     });
   } finally {
@@ -125,6 +127,14 @@ describe("resolveSandboxedMediaSource", () => {
       name: "managed tool media",
       relative: path.join("media", "tool-image-generation", "generated.png"),
     },
+    {
+      name: "managed browser screenshot media",
+      relative: path.join("media", "browser", "screenshot.jpg"),
+    },
+    {
+      name: "managed file-transfer media",
+      relative: path.join("media", "file-transfer", "fetched.bin"),
+    },
   ])("allows $name outside the sandbox root", async ({ relative }) => {
     await withManagedMediaRoot(async ({ stateDir }) => {
       await withSandboxRoot(async (sandboxDir) => {
@@ -145,6 +155,28 @@ describe("resolveSandboxedMediaSource", () => {
     await withManagedMediaRoot(async ({ stateDir }) => {
       const media = path.join(stateDir, "media", "outbound", "reply.png");
       await fs.writeFile(media, "image", "utf8");
+
+      await expect(resolveAllowedManagedMediaPath(media)).resolves.toBe(media);
+    });
+  });
+
+  it("resolves the browser tool's own screenshots as managed media", async () => {
+    // Regression: the browser tool saves screenshots via
+    // saveMediaBuffer(..., "browser", ...), and the agent's reply may
+    // reference that same path with a `MEDIA:` marker. That must not be
+    // silently dropped by the managed-media allowlist.
+    await withManagedMediaRoot(async ({ stateDir }) => {
+      const media = path.join(stateDir, "media", "browser", "screenshot.jpg");
+      await fs.writeFile(media, "image", "utf8");
+
+      await expect(resolveAllowedManagedMediaPath(media)).resolves.toBe(media);
+    });
+  });
+
+  it("resolves the file-transfer tool's fetched files as managed media", async () => {
+    await withManagedMediaRoot(async ({ stateDir }) => {
+      const media = path.join(stateDir, "media", "file-transfer", "fetched.bin");
+      await fs.writeFile(media, "data", "utf8");
 
       await expect(resolveAllowedManagedMediaPath(media)).resolves.toBe(media);
     });
