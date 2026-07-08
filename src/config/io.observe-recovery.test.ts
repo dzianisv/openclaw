@@ -874,7 +874,7 @@ describe("config observe recovery", () => {
           ...deps.fs.promises,
           writeFile: (target, data, options) => {
             if (target === configPath) {
-              directConfigWrites.push(String(target));
+              directConfigWrites.push(target);
             }
             return writeFile(target, data, options);
           },
@@ -922,7 +922,7 @@ describe("config observe recovery", () => {
         ...deps.fs,
         writeFileSync: (target, data, options) => {
           if (target === configPath) {
-            directConfigWrites.push(String(target));
+            directConfigWrites.push(target);
           }
           return writeFileSync(target, data, options);
         },
