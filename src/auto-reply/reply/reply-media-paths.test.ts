@@ -9,6 +9,7 @@ import { getReplyPayloadMetadata, setReplyPayloadMetadata } from "../reply-paylo
 const ensureSandboxWorkspaceForSession = vi.hoisted(() => vi.fn());
 const resolveOutboundAttachmentFromUrl = vi.hoisted(() => vi.fn());
 const resolveAgentScopedOutboundMediaAccess = vi.hoisted(() => vi.fn());
+const subsystemLoggerWarn = vi.hoisted(() => vi.fn());
 const stateDirEnvSnapshot = captureEnv(["OPENCLAW_STATE_DIR"]);
 
 vi.mock("../../agents/sandbox.js", () => ({
@@ -21,6 +22,10 @@ vi.mock("../../media/outbound-attachment.js", () => ({
 
 vi.mock("../../media/read-capability.js", () => ({
   resolveAgentScopedOutboundMediaAccess,
+}));
+
+vi.mock("../../logging/subsystem.js", () => ({
+  createSubsystemLogger: () => ({ warn: subsystemLoggerWarn }),
 }));
 
 import { createReplyMediaPathNormalizer } from "./reply-media-paths.js";
@@ -77,6 +82,7 @@ function expectAgentScopedMediaAccessCall(): Record<string, unknown> {
 
 describe("createReplyMediaPathNormalizer", () => {
   beforeEach(() => {
+    subsystemLoggerWarn.mockReset();
     ensureSandboxWorkspaceForSession.mockReset().mockResolvedValue(null);
     resolveOutboundAttachmentFromUrl.mockReset().mockImplementation(async (mediaUrl: string) => ({
       path: path.join("/tmp/outbound-media", path.basename(mediaUrl.replace(/^file:\/\//i, ""))),
@@ -218,6 +224,29 @@ describe("createReplyMediaPathNormalizer", () => {
 
     expectNoMedia(result);
     expect(resolveOutboundAttachmentFromUrl).not.toHaveBeenCalled();
+  });
+
+  it("logs a dropped reply media path at warning level with structured fields", async () => {
+    // A dropped MEDIA: reference is customer-visible ("⚠️ Media failed."
+    // gets appended to the reply), so it must not be verbose-only logging.
+    const droppedMedia = "file:///Users/peter/Documents/report.pdf";
+    const normalize = createReplyMediaPathNormalizer({
+      cfg: {},
+      sessionKey: "session-key",
+      workspaceDir: "/tmp/agent-workspace",
+    });
+
+    const result = await normalize({
+      mediaUrls: [droppedMedia],
+    });
+
+    expectNoMedia(result);
+    expect(result.text).toBe("⚠️ Media failed.");
+    expect(subsystemLoggerWarn).toHaveBeenCalledTimes(1);
+    const [message, meta] = subsystemLoggerWarn.mock.calls[0] as [string, Record<string, unknown>];
+    expect(message).toContain(droppedMedia);
+    expect(meta.mediaPath).toBe(droppedMedia);
+    expect(meta.error).toBeDefined();
   });
 
   it("drops host file URLs even when sandbox exists", async () => {

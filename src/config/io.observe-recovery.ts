@@ -1,5 +1,7 @@
 // Observes and recovers config files that appear missing, corrupt, or clobbered.
 import crypto from "node:crypto";
+import path from "node:path";
+import { replaceFileAtomic, replaceFileAtomicSync } from "../infra/replace-file.js";
 import { isRecord } from "../utils.js";
 import {
   appendConfigAuditRecord,
@@ -93,6 +95,13 @@ export type ObserveRecoveryDeps = {
   env: NodeJS.ProcessEnv;
   homedir: () => string;
   logger: Pick<typeof console, "warn">;
+  /**
+   * Atomic replace used for backup-restore writes; defaults to the shared
+   * replaceFileAtomic helpers (the same primitive as the config writer) so a
+   * concurrent reader never observes a torn config file. Injectable for tests.
+   */
+  replaceFileAtomic?: typeof replaceFileAtomic;
+  replaceFileAtomicSync?: typeof replaceFileAtomicSync;
 };
 
 type ConfigStatMetadataSource =
@@ -675,9 +684,16 @@ export async function maybeRecoverSuspiciousConfigRead(
   let restoredFromBackup = false;
   let restoreError: unknown;
   try {
-    await params.deps.fs.promises.writeFile(params.configPath, backupRaw, {
-      encoding: "utf-8",
+    // Restore atomically (tmp+rename), matching the primary config writer.
+    // A direct writeFile here truncates the live config first, so a concurrent
+    // reader (gateway or CLI subprocess) could observe torn JSON mid-restore.
+    await (params.deps.replaceFileAtomic ?? replaceFileAtomic)({
+      filePath: params.configPath,
+      content: backupRaw,
+      dirMode: 0o700,
       mode: 0o600,
+      tempPrefix: path.basename(params.configPath),
+      copyFallbackOnPermissionError: true,
     });
     await chmodConfigBestEffort({
       deps: params.deps,
@@ -789,9 +805,16 @@ export function maybeRecoverSuspiciousConfigReadSync(
   let restoredFromBackup = false;
   let restoreError: unknown;
   try {
-    params.deps.fs.writeFileSync(params.configPath, backupRaw, {
-      encoding: "utf-8",
+    // Restore atomically (tmp+rename), matching the primary config writer.
+    // A direct writeFileSync here truncates the live config first, so a
+    // concurrent reader could observe torn JSON mid-restore.
+    (params.deps.replaceFileAtomicSync ?? replaceFileAtomicSync)({
+      filePath: params.configPath,
+      content: backupRaw,
+      dirMode: 0o700,
       mode: 0o600,
+      tempPrefix: path.basename(params.configPath),
+      copyFallbackOnPermissionError: true,
     });
     chmodConfigBestEffortSync({
       deps: params.deps,

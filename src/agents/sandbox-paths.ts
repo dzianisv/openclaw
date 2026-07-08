@@ -21,7 +21,12 @@ import { resolveConfigDir } from "../utils.js";
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const DATA_URL_RE = /^data:/i;
 const SANDBOX_CONTAINER_WORKDIR = "/workspace";
-const MANAGED_MEDIA_SUBDIRS = new Set(["outbound"]);
+// Subdirs under the managed media root that tools write for the agent's own
+// use (screenshots, fetched files, etc.) and that a reply's `MEDIA:` marker
+// may legitimately reference. Do not add "inbound" here: that subdir holds
+// user-sent content, and allowing it back into replies would let a reply
+// marker re-serve attacker-controlled uploads through this trust boundary.
+const MANAGED_MEDIA_SUBDIRS = new Set(["outbound", "browser", "file-transfer"]);
 
 function normalizeUnicodeSpaces(str: string): string {
   return str.replace(UNICODE_SPACES, " ");

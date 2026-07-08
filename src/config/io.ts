@@ -34,6 +34,7 @@ import {
   type PluginMetadataSnapshot,
 } from "../plugins/plugin-metadata-snapshot.js";
 import { isRecord } from "../utils.js";
+import { sleep } from "../utils/sleep.js";
 import { VERSION } from "../version.js";
 import { DuplicateAgentDirError, findDuplicateAgentDirs } from "./agent-dirs.js";
 import { maintainConfigBackups } from "./backup-rotation.js";
@@ -1206,6 +1207,10 @@ type ConfigReadResolution = {
   envWarnings: EnvSubstitutionWarning[];
 };
 
+// Bounded re-read on JSON5 parse failure (see readConfigFileSnapshotInternal).
+const CONFIG_PARSE_RETRY_ATTEMPTS = 2;
+const CONFIG_PARSE_RETRY_DELAY_MS = 25;
+
 const TILDE_PATH_VALUE_RE = /^~(?=$|[\\/])/;
 const PATH_LIKE_CONFIG_KEY_RE = /(dir|path|paths|file|root|workspace)$/i;
 const PATH_LIKE_CONFIG_LIST_KEYS = new Set(["paths", "pathPrepend"]);
@@ -1950,15 +1955,33 @@ export function createConfigIO(
     const includeFileTargetsForWrite: Record<string, string> = {};
 
     try {
-      const raw = await deps.measure("config.snapshot.read.file", () =>
+      let raw = await deps.measure("config.snapshot.read.file", () =>
         deps.fs.readFileSync(configPath, "utf-8"),
       );
+      let parsedRes = await deps.measure("config.snapshot.read.parse", () =>
+        parseConfigJson5(raw, deps.json5),
+      );
+      // Torn-read tolerance, not error suppression: config writers replace the
+      // file atomically (tmp+rename), so a parse failure here is most likely a
+      // read that raced a concurrent replace. A short bounded re-read settles
+      // on either the fully-old or fully-new content. A persistently invalid
+      // file still fails after the retries.
+      for (
+        let attempt = 1;
+        !parsedRes.ok && attempt <= CONFIG_PARSE_RETRY_ATTEMPTS;
+        attempt += 1
+      ) {
+        await sleep(CONFIG_PARSE_RETRY_DELAY_MS * attempt);
+        raw = await deps.measure("config.snapshot.read.file", () =>
+          deps.fs.readFileSync(configPath, "utf-8"),
+        );
+        parsedRes = await deps.measure("config.snapshot.read.parse", () =>
+          parseConfigJson5(raw, deps.json5),
+        );
+      }
       const rawHash = await deps.measure("config.snapshot.read.hash", () => hashConfigRaw(raw));
       fallbackRaw = raw;
       fallbackHash = rawHash;
-      const parsedRes = await deps.measure("config.snapshot.read.parse", () =>
-        parseConfigJson5(raw, deps.json5),
-      );
       if (!parsedRes.ok) {
         return await finalizeReadConfigSnapshotInternalResult(deps, {
           snapshot: createConfigFileSnapshot({

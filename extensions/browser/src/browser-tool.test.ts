@@ -1073,6 +1073,54 @@ describe("browser tool snapshot maxChars", () => {
     expect(browserClientMocks.browserDoctor).not.toHaveBeenCalled();
   });
 
+  it("navigates to a provided url before capturing a screenshot", async () => {
+    // Regression: a url passed on a screenshot call used to be silently
+    // ignored (only navigate/open read it), so the active — possibly stale,
+    // possibly private — tab got captured instead of the requested page.
+    browserActionsMocks.browserNavigate.mockResolvedValueOnce({
+      ok: true,
+      targetId: "tab-navigated",
+    } as never);
+    const tool = createBrowserTool();
+    await tool.execute?.("call-1", {
+      action: "screenshot",
+      target: "host",
+      url: "https://example.com/report",
+    });
+
+    const navRequest = lastMockCallArg<{ url?: string; targetId?: string }>(
+      browserActionsMocks.browserNavigate,
+      1,
+    );
+    expect(navRequest.url).toBe("https://example.com/report");
+    // Navigation must complete before the capture is issued.
+    const navOrder = browserActionsMocks.browserNavigate.mock.invocationCallOrder[0];
+    const shotOrder = browserActionsMocks.browserScreenshotAction.mock.invocationCallOrder[0];
+    expect(navOrder).toBeLessThan(shotOrder as number);
+    // The capture targets the navigated tab, not whatever tab was active.
+    const shotOpts = lastMockCallArg<{ targetId?: string }>(
+      browserActionsMocks.browserScreenshotAction,
+      1,
+    );
+    expect(shotOpts.targetId).toBe("tab-navigated");
+  });
+
+  it("does not navigate when screenshot has no url", async () => {
+    const tool = createBrowserTool();
+    await tool.execute?.("call-1", {
+      action: "screenshot",
+      target: "host",
+      targetId: "tab-1",
+    });
+
+    expect(browserActionsMocks.browserNavigate).not.toHaveBeenCalled();
+    const shotOpts = lastMockCallArg<{ targetId?: string }>(
+      browserActionsMocks.browserScreenshotAction,
+      1,
+    );
+    expect(shotOpts.targetId).toBe("tab-1");
+  });
+
   it("passes screenshot timeoutMs to the host browser client", async () => {
     const tool = createBrowserTool();
     await tool.execute?.("call-1", {
