@@ -14,6 +14,7 @@ import {
   buildAttemptReplayMetadata,
   DEFAULT_EMPTY_RESPONSE_RETRY_LIMIT,
   DEFAULT_REASONING_ONLY_RETRY_LIMIT,
+  DEFAULT_SILENT_NO_DELIVERY_RETRY_LIMIT,
   EMPTY_RESPONSE_RETRY_INSTRUCTION,
   extractPlanningOnlyPlanDetails,
   isLikelyExecutionAckPrompt,
@@ -21,9 +22,12 @@ import {
   REASONING_ONLY_RETRY_INSTRUCTION,
   resolveAckExecutionFastPathInstruction,
   resolveEmptyResponseRetryInstruction,
+  resolveIncompleteTurnPayloadText,
   resolvePlanningOnlyRetryLimit,
   resolvePlanningOnlyRetryInstruction,
   resolveReasoningOnlyRetryInstruction,
+  resolveSilentNoDeliveryRetryInstruction,
+  SILENT_NO_DELIVERY_RETRY_INSTRUCTION,
   STRICT_AGENTIC_BLOCKED_TEXT,
   resolveReplayInvalidFlag,
   resolveRunLivenessState,
@@ -946,6 +950,245 @@ describe("runEmbeddedPiAgent incomplete-turn safety", () => {
     });
 
     expect(retryInstruction).toBeNull();
+  });
+
+  it("retries a NO_REPLY black-hole turn on a direct user trigger, then falls through silently after exhaustion", async () => {
+    // Root cause A of OpenClawBot #2903: a direct user turn can emit only the
+    // silent token with no delivery and no side effect. This must get one
+    // retry with a deliver-now nudge; if the retry also comes back silent,
+    // the run must not be converted into a fabricated error (NO_REPLY still
+    // has non-zero text length, so resolveIncompleteTurnPayloadText does not
+    // catch it) — it falls through to the normal empty-payload completion,
+    // but loudly, via the exhausted warn.
+    mockedClassifyFailoverReason.mockReturnValue(null);
+    mockedRunEmbeddedAttempt.mockResolvedValue(
+      makeAttemptResult({
+        assistantTexts: ["NO_REPLY"],
+        lastAssistant: {
+          role: "assistant",
+          stopReason: "stop",
+          provider: "openai",
+          model: "gpt-5.4",
+          content: [{ type: "text", text: "NO_REPLY" }],
+        } as unknown as EmbeddedRunAttemptResult["lastAssistant"],
+      }),
+    );
+
+    const result = await runEmbeddedPiAgent({
+      ...overflowBaseRunParams,
+      trigger: "user",
+      provider: "openai",
+      model: "gpt-5.4",
+      runId: "run-silent-no-delivery-user-turn",
+    });
+
+    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(2);
+    const secondCall = mockedRunEmbeddedAttempt.mock.calls[1]?.[0] as { prompt?: string };
+    expect(secondCall.prompt).toContain(SILENT_NO_DELIVERY_RETRY_INSTRUCTION);
+    expect(mockedLog.warn).toHaveBeenCalledWith(
+      expect.stringContaining("silent no-delivery turn detected"),
+    );
+    expect(mockedLog.warn).toHaveBeenCalledWith(
+      expect.stringContaining("silent no-delivery retries exhausted"),
+    );
+    expect(result.payloads).toBeUndefined();
+  });
+
+  it("does not retry a NO_REPLY turn on a non-user trigger (heartbeat)", async () => {
+    // NO_REPLY is the expected, correct outcome on heartbeat/cron/memory/manual
+    // triggers; the resolver must not fire there.
+    mockedClassifyFailoverReason.mockReturnValue(null);
+    mockedRunEmbeddedAttempt.mockResolvedValue(
+      makeAttemptResult({
+        assistantTexts: ["NO_REPLY"],
+        lastAssistant: {
+          role: "assistant",
+          stopReason: "stop",
+          provider: "openai",
+          model: "gpt-5.4",
+          content: [{ type: "text", text: "NO_REPLY" }],
+        } as unknown as EmbeddedRunAttemptResult["lastAssistant"],
+      }),
+    );
+
+    const result = await runEmbeddedPiAgent({
+      ...overflowBaseRunParams,
+      trigger: "heartbeat",
+      provider: "openai",
+      model: "gpt-5.4",
+      runId: "run-silent-no-delivery-heartbeat-trigger",
+    });
+
+    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(1);
+    expect(result.payloads).toBeUndefined();
+  });
+});
+
+describe("resolveSilentNoDeliveryRetryInstruction", () => {
+  const baseParams = {
+    trigger: "user" as const,
+    payloadCount: 0,
+    aborted: false,
+    timedOut: false,
+  };
+
+  function makeSilentAttempt(
+    overrides: Partial<
+      Parameters<typeof resolveSilentNoDeliveryRetryInstruction>[0]["attempt"]
+    > = {},
+  ): Parameters<typeof resolveSilentNoDeliveryRetryInstruction>[0]["attempt"] {
+    return {
+      assistantTexts: ["NO_REPLY"],
+      clientToolCall: undefined,
+      yieldDetected: false,
+      didSendDeterministicApprovalPrompt: false,
+      didSendViaMessagingTool: false,
+      lastToolError: undefined,
+      replayMetadata: buildAttemptReplayMetadata({
+        toolMetas: [],
+        didSendViaMessagingTool: false,
+      }),
+      ...overrides,
+    };
+  }
+
+  it("fires on an exact-token direct user turn with no delivery and no side effect", () => {
+    const instruction = resolveSilentNoDeliveryRetryInstruction({
+      ...baseParams,
+      attempt: makeSilentAttempt(),
+    });
+
+    expect(instruction).toBe(SILENT_NO_DELIVERY_RETRY_INSTRUCTION);
+    expect(DEFAULT_SILENT_NO_DELIVERY_RETRY_LIMIT).toBe(1);
+  });
+
+  it.each(["heartbeat", "cron", "memory", "manual", "overflow", undefined] as const)(
+    "does not fire for trigger=%s",
+    (trigger) => {
+      const instruction = resolveSilentNoDeliveryRetryInstruction({
+        ...baseParams,
+        trigger,
+        attempt: makeSilentAttempt(),
+      });
+
+      expect(instruction).toBeNull();
+    },
+  );
+
+  it("does not fire when the messaging tool already delivered the reply", () => {
+    const instruction = resolveSilentNoDeliveryRetryInstruction({
+      ...baseParams,
+      attempt: makeSilentAttempt({
+        didSendViaMessagingTool: true,
+        replayMetadata: buildAttemptReplayMetadata({
+          toolMetas: [],
+          didSendViaMessagingTool: true,
+        }),
+      }),
+    });
+
+    expect(instruction).toBeNull();
+  });
+
+  it("does not fire when the attempt had a potential side effect (mutating tool call)", () => {
+    const toolMetas = [{ toolName: "write" }];
+    const instruction = resolveSilentNoDeliveryRetryInstruction({
+      ...baseParams,
+      attempt: makeSilentAttempt({
+        replayMetadata: buildAttemptReplayMetadata({
+          toolMetas,
+          didSendViaMessagingTool: false,
+        }),
+      }),
+    });
+
+    expect(instruction).toBeNull();
+  });
+
+  it("does not fire when a successful cron add occurred (side effect)", () => {
+    const instruction = resolveSilentNoDeliveryRetryInstruction({
+      ...baseParams,
+      attempt: makeSilentAttempt({
+        replayMetadata: buildAttemptReplayMetadata({
+          toolMetas: [],
+          didSendViaMessagingTool: false,
+          successfulCronAdds: 1,
+        }),
+      }),
+    });
+
+    expect(instruction).toBeNull();
+  });
+
+  it("does not fire when payloadCount is non-zero", () => {
+    const instruction = resolveSilentNoDeliveryRetryInstruction({
+      ...baseParams,
+      payloadCount: 1,
+      attempt: makeSilentAttempt(),
+    });
+
+    expect(instruction).toBeNull();
+  });
+
+  it("does not fire for non-exact silent-token text (real content plus the word NO_REPLY)", () => {
+    const instruction = resolveSilentNoDeliveryRetryInstruction({
+      ...baseParams,
+      attempt: makeSilentAttempt({
+        assistantTexts: ["Here is my answer, done. NO_REPLY is a token some agents use."],
+      }),
+    });
+
+    expect(instruction).toBeNull();
+  });
+
+  it("does not fire when aborted or timed out", () => {
+    expect(
+      resolveSilentNoDeliveryRetryInstruction({
+        ...baseParams,
+        aborted: true,
+        attempt: makeSilentAttempt(),
+      }),
+    ).toBeNull();
+    expect(
+      resolveSilentNoDeliveryRetryInstruction({
+        ...baseParams,
+        timedOut: true,
+        attempt: makeSilentAttempt(),
+      }),
+    ).toBeNull();
+  });
+
+  it("does not fire when a client tool call, yield, approval prompt, or tool error is present", () => {
+    expect(
+      resolveSilentNoDeliveryRetryInstruction({
+        ...baseParams,
+        attempt: makeSilentAttempt({
+          clientToolCall: { name: "some_tool", params: {} },
+        }),
+      }),
+    ).toBeNull();
+    expect(
+      resolveSilentNoDeliveryRetryInstruction({
+        ...baseParams,
+        attempt: makeSilentAttempt({ yieldDetected: true }),
+      }),
+    ).toBeNull();
+    expect(
+      resolveSilentNoDeliveryRetryInstruction({
+        ...baseParams,
+        attempt: makeSilentAttempt({ didSendDeterministicApprovalPrompt: true }),
+      }),
+    ).toBeNull();
+    expect(
+      resolveSilentNoDeliveryRetryInstruction({
+        ...baseParams,
+        attempt: makeSilentAttempt({
+          lastToolError: { toolName: "some_tool", message: "boom" } as unknown as Parameters<
+            typeof resolveSilentNoDeliveryRetryInstruction
+          >[0]["attempt"]["lastToolError"],
+        }),
+      }),
+    ).toBeNull();
   });
 });
 

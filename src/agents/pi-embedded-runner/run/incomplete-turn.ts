@@ -1,10 +1,12 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import { isSilentReplyPayloadText, SILENT_REPLY_TOKEN } from "../../../auto-reply/tokens.js";
 import type { EmbeddedPiExecutionContract } from "../../../config/types.agent-defaults.js";
 import { normalizeLowercaseStringOrEmpty } from "../../../shared/string-coerce.js";
 import { isStrictAgenticSupportedProviderModel } from "../../execution-contract.js";
 import { isLikelyMutatingToolName } from "../../tool-mutation.js";
 import { assessLastAssistantMessage } from "../thinking.js";
 import type { EmbeddedRunLivenessState } from "../types.js";
+import type { EmbeddedRunTrigger } from "./params.js";
 import type { EmbeddedRunAttemptResult } from "./types.js";
 
 type ReplayMetadataAttempt = Pick<
@@ -20,7 +22,6 @@ type IncompleteTurnAttempt = Pick<
   | "yieldDetected"
   | "didSendDeterministicApprovalPrompt"
   | "lastToolError"
-  | "assistantTexts"
   | "toolMetas"
   | "lastAssistant"
   | "replayMetadata"
@@ -45,6 +46,17 @@ type PlanningOnlyAttempt = Pick<
 type RunLivenessAttempt = Pick<
   EmbeddedRunAttemptResult,
   "lastAssistant" | "promptErrorSource" | "replayMetadata" | "timedOutDuringCompaction"
+>;
+
+type SilentNoDeliveryAttempt = Pick<
+  EmbeddedRunAttemptResult,
+  | "assistantTexts"
+  | "clientToolCall"
+  | "yieldDetected"
+  | "didSendDeterministicApprovalPrompt"
+  | "didSendViaMessagingTool"
+  | "lastToolError"
+  | "replayMetadata"
 >;
 
 export function isIncompleteTerminalAssistantTurn(params: {
@@ -83,6 +95,11 @@ const STRICT_AGENTIC_PLANNING_ONLY_RETRY_LIMIT = 2;
 // surfacing the existing incomplete-turn error path.
 export const DEFAULT_REASONING_ONLY_RETRY_LIMIT = 2;
 export const DEFAULT_EMPTY_RESPONSE_RETRY_LIMIT = 1;
+// A direct user turn that emits only the silent token without any delivery or
+// side effect is a black hole: the user never gets a reply and never gets an
+// error. One retry with an explicit "you must actually reply" nudge is enough
+// to recover the common case without masking a model that is genuinely stuck.
+export const DEFAULT_SILENT_NO_DELIVERY_RETRY_LIMIT = 1;
 const ACK_EXECUTION_NORMALIZED_SET = new Set([
   "ok",
   "okay",
@@ -139,6 +156,7 @@ export const ACK_EXECUTION_FAST_PATH_INSTRUCTION =
   "The latest user message is a short approval to proceed. Do not recap or restate the plan. Start with the first concrete tool action immediately. Keep any user-facing follow-up brief and natural.";
 export const STRICT_AGENTIC_BLOCKED_TEXT =
   "Agent stopped after repeated plan-only turns without taking a concrete action. No concrete tool action or external side effect advanced the task.";
+export const SILENT_NO_DELIVERY_RETRY_INSTRUCTION = `The previous attempt replied with only the silent "${SILENT_REPLY_TOKEN}" token and did not send anything to the user and had no other side effect. This is a direct user turn, so a silent reply is never correct here. Continue from the current state and either deliver a real reply via the message tool, or write a normal visible answer now. Do not reply with the silent token again.`;
 
 export type PlanningOnlyPlanDetails = {
   explanation: string;
@@ -373,6 +391,49 @@ export function resolveEmptyResponseRetryInstruction(params: {
   }
 
   return EMPTY_RESPONSE_RETRY_INSTRUCTION;
+}
+
+/**
+ * Detects the NO_REPLY black-hole: on a direct user turn, the model emits
+ * only the exact silent token, but never delivered anything via the
+ * messaging tool and produced no other side effect. Unlike the
+ * planning-only/reasoning-only/empty-response resolvers above, this is not
+ * gated behind strict-agentic providers — the failure mode is provider
+ * agnostic, and `isEmptyResponseAssistantTurn` cannot see it because
+ * "NO_REPLY" has non-zero length. Guarded tightly (exact trigger, exact
+ * token, zero payloads, no side effects) so it can only fire on the genuine
+ * black-hole case and cannot mask a legitimate silent turn on a non-user
+ * trigger (heartbeat/cron/memory/manual/overflow) where NO_REPLY is the
+ * expected, correct outcome.
+ */
+export function resolveSilentNoDeliveryRetryInstruction(params: {
+  trigger?: EmbeddedRunTrigger;
+  payloadCount: number;
+  aborted: boolean;
+  timedOut: boolean;
+  attempt: SilentNoDeliveryAttempt;
+}): string | null {
+  if (
+    params.trigger !== "user" ||
+    params.aborted ||
+    params.timedOut ||
+    params.payloadCount !== 0 ||
+    params.attempt.didSendViaMessagingTool ||
+    params.attempt.replayMetadata.hadPotentialSideEffects ||
+    params.attempt.clientToolCall ||
+    params.attempt.yieldDetected ||
+    params.attempt.didSendDeterministicApprovalPrompt ||
+    params.attempt.lastToolError
+  ) {
+    return null;
+  }
+
+  const text = params.attempt.assistantTexts.join("\n\n").trim();
+  if (!isSilentReplyPayloadText(text, SILENT_REPLY_TOKEN)) {
+    return null;
+  }
+
+  return SILENT_NO_DELIVERY_RETRY_INSTRUCTION;
 }
 
 function shouldApplyPlanningOnlyRetryGuard(params: {
