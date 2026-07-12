@@ -99,6 +99,7 @@ import {
 import {
   DEFAULT_EMPTY_RESPONSE_RETRY_LIMIT,
   DEFAULT_REASONING_ONLY_RETRY_LIMIT,
+  DEFAULT_SILENT_NO_DELIVERY_RETRY_LIMIT,
   resolveAckExecutionFastPathInstruction,
   extractPlanningOnlyPlanDetails,
   resolveEmptyResponseRetryInstruction,
@@ -106,6 +107,7 @@ import {
   resolvePlanningOnlyRetryLimit,
   resolvePlanningOnlyRetryInstruction,
   resolveReasoningOnlyRetryInstruction,
+  resolveSilentNoDeliveryRetryInstruction,
   STRICT_AGENTIC_BLOCKED_TEXT,
   resolveReplayInvalidFlag,
   resolveRunLivenessState,
@@ -455,6 +457,7 @@ export async function runEmbeddedPiAgent(
       const maxPlanningOnlyRetryAttempts = resolvePlanningOnlyRetryLimit(executionContract);
       const maxReasoningOnlyRetryAttempts = DEFAULT_REASONING_ONLY_RETRY_LIMIT;
       const maxEmptyResponseRetryAttempts = DEFAULT_EMPTY_RESPONSE_RETRY_LIMIT;
+      const maxSilentNoDeliveryRetryAttempts = DEFAULT_SILENT_NO_DELIVERY_RETRY_LIMIT;
 
       const MAX_TIMEOUT_COMPACTION_ATTEMPTS = 2;
       const MAX_OVERFLOW_COMPACTION_ATTEMPTS = 3;
@@ -472,11 +475,13 @@ export async function runEmbeddedPiAgent(
       let planningOnlyRetryAttempts = 0;
       let reasoningOnlyRetryAttempts = 0;
       let emptyResponseRetryAttempts = 0;
+      let silentNoDeliveryRetryAttempts = 0;
       let sameModelIdleTimeoutRetries = 0;
       let lastRetryFailoverReason: FailoverReason | null = null;
       let planningOnlyRetryInstruction: string | null = null;
       let reasoningOnlyRetryInstruction: string | null = null;
       let emptyResponseRetryInstruction: string | null = null;
+      let silentNoDeliveryRetryInstruction: string | null = null;
       const ackExecutionFastPathInstruction = resolveAckExecutionFastPathInstruction({
         provider,
         modelId,
@@ -662,6 +667,7 @@ export async function runEmbeddedPiAgent(
             planningOnlyRetryInstruction,
             reasoningOnlyRetryInstruction,
             emptyResponseRetryInstruction,
+            silentNoDeliveryRetryInstruction,
           ].filter(
             (value): value is string => typeof value === "string" && value.trim().length > 0,
           );
@@ -1719,6 +1725,13 @@ export async function runEmbeddedPiAgent(
             timedOut,
             attempt,
           });
+          const nextSilentNoDeliveryRetryInstruction = resolveSilentNoDeliveryRetryInstruction({
+            trigger: params.trigger,
+            payloadCount,
+            aborted,
+            timedOut,
+            attempt,
+          });
           if (
             nextPlanningOnlyRetryInstruction &&
             planningOnlyRetryAttempts < maxPlanningOnlyRetryAttempts
@@ -1787,6 +1800,22 @@ export async function runEmbeddedPiAgent(
               `empty response detected: runId=${params.runId} sessionId=${params.sessionId} ` +
                 `provider=${activeErrorContext.provider}/${activeErrorContext.model} — retrying ${emptyResponseRetryAttempts}/${maxEmptyResponseRetryAttempts} ` +
                 `with visible-answer continuation`,
+            );
+            continue;
+          }
+          if (
+            !nextPlanningOnlyRetryInstruction &&
+            !nextReasoningOnlyRetryInstruction &&
+            !nextEmptyResponseRetryInstruction &&
+            nextSilentNoDeliveryRetryInstruction &&
+            silentNoDeliveryRetryAttempts < maxSilentNoDeliveryRetryAttempts
+          ) {
+            silentNoDeliveryRetryAttempts += 1;
+            silentNoDeliveryRetryInstruction = nextSilentNoDeliveryRetryInstruction;
+            log.warn(
+              `silent no-delivery turn detected: runId=${params.runId} sessionId=${params.sessionId} ` +
+                `provider=${activeErrorContext.provider}/${activeErrorContext.model} trigger=${params.trigger ?? "unknown"} — retrying ` +
+                `${silentNoDeliveryRetryAttempts}/${maxSilentNoDeliveryRetryAttempts} with deliver-now steer`,
             );
             continue;
           }
@@ -1907,6 +1936,19 @@ export async function runEmbeddedPiAgent(
             log.warn(
               `empty response retries exhausted: runId=${params.runId} sessionId=${params.sessionId} ` +
                 `provider=${activeErrorContext.provider}/${activeErrorContext.model} attempts=${emptyResponseRetryAttempts}/${maxEmptyResponseRetryAttempts} — surfacing incomplete-turn error`,
+            );
+          }
+          if (
+            !nextPlanningOnlyRetryInstruction &&
+            !nextReasoningOnlyRetryInstruction &&
+            !nextEmptyResponseRetryInstruction &&
+            nextSilentNoDeliveryRetryInstruction &&
+            silentNoDeliveryRetryAttempts >= maxSilentNoDeliveryRetryAttempts
+          ) {
+            log.warn(
+              `silent no-delivery retries exhausted: runId=${params.runId} sessionId=${params.sessionId} ` +
+                `provider=${activeErrorContext.provider}/${activeErrorContext.model} trigger=${params.trigger ?? "unknown"} ` +
+                `attempts=${silentNoDeliveryRetryAttempts}/${maxSilentNoDeliveryRetryAttempts} — surfacing incomplete-turn error`,
             );
           }
           if (incompleteTurnText) {
